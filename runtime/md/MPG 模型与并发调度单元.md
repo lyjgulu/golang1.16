@@ -250,3 +250,54 @@ DATA	runtime·mainPC+0(SB)/8,$runtime·main(SB)
 GLOBL	runtime·mainPC(SB),RODATA,$8
 ```
 
+![schedinit](https://raw.githubusercontent.com/lyjgulu/golang1.16/main/runtime/image/schedinit.png)
+
+## M初始化
+
+M 其实就是 OS 线程，它只有两个状态：自旋、非自旋。 在调度器初始化阶段，只有一个 M，那就是主 OS 线程，因此这里的 `commoninit` 仅仅只是对 M 进行一个初步的初始化， 该初始化包含对 M 及用于处理 M 信号的 G 的相关运算操作，未涉及工作线程的暂止和复始。
+
+``` go
+// src/runtime/proc.go
+
+func mcommoninit(mp *m) {
+	(...)
+
+	lock(&sched.lock)
+	(...)
+
+	// mnext 表示当前 m 的数量，还表示下一个 m 的 id
+	// 增加 m 的数量
+	if id >= 0 {
+		mp.id = id
+	} else {
+		mp.id = mReserveID()
+	}
+  /*func mReserveID() int64 {
+      assertLockHeld(&sched.lock)
+
+      if sched.mnext+1 < sched.mnext {
+        throw("runtime: thread ID overflow")
+      }
+      id := sched.mnext
+      sched.mnext++
+      checkmcount()
+      return id
+	}*/
+
+	(...) // 初始化 gsignal，用于处理 m 上的信号
+
+	// 添加到 allm 中，从而当它刚保存到寄存器或本地线程存储时候 GC 不会释放 g.m
+	mp.alllink = allm
+
+	// NumCgoCall() 会在没有使用 schedlock 时遍历 allm，等价于 allm = mp
+	atomicstorep(unsafe.Pointer(&allm), unsafe.Pointer(mp))
+	unlock(&sched.lock)
+
+	(...)
+}
+```
+
+## P 初始化
+
+![p-status](https://raw.githubusercontent.com/lyjgulu/golang1.16/main/runtime/image/p-status.png)
+
