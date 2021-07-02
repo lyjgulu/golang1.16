@@ -566,3 +566,5 @@ func GOMAXPROCS(n int) int {
 
 在看 `runtime.newproc` 之前，我们先大致浏览一下 G 的各个状态，如图 3 所示。
 
+![g-status](https://raw.githubusercontent.com/lyjgulu/golang1.16/main/runtime/image/g-status.png)
+
