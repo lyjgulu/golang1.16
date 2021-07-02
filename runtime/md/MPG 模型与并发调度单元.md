@@ -568,3 +568,217 @@ func GOMAXPROCS(n int) int {
 
 ![g-status](https://raw.githubusercontent.com/lyjgulu/golang1.16/main/runtime/image/g-status.png)
 
+``` go
+// src/runtime/proc.go
+//go:nosplit 函数在执行过程中不会发生扩张和抢占
+func newproc(siz int32, fn *funcval) {
+  // 从 fn 的地址增加一个指针的长度，从而获取第一参数地址
+	argp := add(unsafe.Pointer(&fn), sys.PtrSize)
+	gp := getg()
+	pc := getcallerpc()		// 获取调用方 PC/IP 寄存器值
+  // 用 g0 系统栈创建 Goroutine 对象
+	// 传递的参数包括 fn 函数入口地址, argp 参数起始地址, siz 参数长度, gp（g0），调用方 pc（goroutine）
+	systemstack(func() {
+		newg := newproc1(fn, argp, siz, gp, pc)
+
+		_p_ := getg().m.p.ptr()
+    // 将这里新创建的 g 放入 p 的本地队列或直接放入全局队列
+		// true 表示放入执行队列的下一个，false 表示放入队尾
+		runqput(_p_, newg, true)
+		// 主线程是否已启动,初始化阶段为false
+		if mainStarted {
+      // 尝试再添加一个 P 来执行 G。当 G 变为可运行（newproc，ready）时调用。
+			wakep()
+		}
+	})
+}
+
+type funcval struct {
+	fn uintptr
+	// 变长大小，fn 的数据在应在 fn 之后
+}
+
+// getcallerpc 返回它调用方的调用方程序计数器 PC program conter
+//go:noescape
+func getcallerpc() uintptr
+```
+
+详细的参数获取过程需要编译器的配合，也是实现 Goroutine 的关键。我们来看一下具体的传参过程：
+
+``` go
+package main
+
+func hello(msg string) {
+	println(msg)
+}
+
+func main() {
+	go hello("hello world")
+}
+```
+
+``` c
+LEAQ go.string.*+1874(SB), AX // 将 "hello world" 的地址给 AX
+MOVQ AX, 0x10(SP)             // 将 AX 的值放到 0x10
+MOVL $0x10, 0(SP)             // 将最后一个参数的位置存到栈顶 0x00
+LEAQ go.func.*+67(SB), AX     // 将 go 语句调用的函数入口地址给 AX
+MOVQ AX, 0x8(SP)              // 将 AX 存入 0x08
+CALL runtime.newproc(SB)      // 调用 newproc
+```
+
+这个过程里我们基本上可以看到栈是这样排布的：
+
+``` 
+             栈布局
+      |                 |       高地址
+      |                 |
+      +-----------------+ 
+      | &"hello world"  |
+0x10  +-----------------+ <--- fn + sys.PtrSize
+      |      hello      |
+0x08  +-----------------+ <--- fn
+      |       siz       |
+0x00  +-----------------+ SP
+      |    newproc PC   |  
+      +-----------------+ callerpc: 要运行的 Goroutine 的 PC
+      |                 |
+      |                 |       低地址
+```
+
+从而当 `newproc` 开始运行时，先获得 siz 作为第一个参数，再获得 fn 作为第二个参数， 然后通过 `add` 计算出 `fn` 参数开始的位置。
+
+现在我们知道 `newproc` 会获取需要执行的 Goroutine 要执行的函数体的地址、 参数起始地址、参数长度、以及 Goroutine 的调用地址。 然后在 g0 系统栈上通过 `newproc1` 创建并初始化新的 Goroutine ，下面我们来看 `newproc1`。
+
+``` go
+// 创建一个运行 fn 的新 g，具有 narg 字节大小的参数，从 argp 开始。
+// callerps 是 go 语句的起始地址。新创建的 g 会被放入 g 的队列中等待运行。
+func newproc1(fn *funcval, argp *uint8, narg int32, callergp *g, callerpc uintptr) *g {
+  (...)
+	_g_ := getg() // 因为是在系统栈运行所以此时的 g 为 g0
+	(...)
+
+  if fn == nil {
+		_g_.m.throwing = -1 // do not dump full stacks
+		throw("go of nil func value")
+	}
+	acquirem() // disable preemption because it can be holding p in a local var 禁止这时 g 的 m 被抢占因为它可以在一个局部变量中保存 p
+	siz := narg
+	siz = (siz + 7) &^ 7
+  /*func acquirem() *m {
+    _g_ := getg()
+    _g_.m.locks++
+    return _g_.m
+	}*/
+	(...)
+
+	// 获得 p
+	_p_ := _g_.m.p.ptr()
+	// 根据 p 获得一个新的 g
+	newg := gfget(_p_)
+
+	// 初始化阶段，gfget 是不可能找到 g 的
+	// 也可能运行中本来就已经耗尽了
+	if newg == nil {
+		// 创建一个拥有 _StackMin 大小的栈的 g
+		newg = malg(_StackMin)
+		// 将新创建的 g 从 _Gidle 更新为 _Gdead 状态
+		casgstatus(newg, _Gidle, _Gdead)
+		allgadd(newg) // 将 Gdead 状态的 g 添加到 allg，这样 GC 不会扫描未初始化的栈
+	}
+	(...)
+
+	// 计算运行空间大小，对齐
+	totalSize := 4*sys.RegSize + uintptr(siz) + sys.MinFrameSize // extra space in case of reads slightly beyond frame
+	totalSize += -totalSize & (sys.SpAlign - 1)                  // align to spAlign
+
+	// 确定 sp 和参数入栈位置
+	sp := newg.stack.hi - totalSize
+	spArg := sp
+	(...)
+
+	// 处理参数，当有参数时，将参数拷贝到 Goroutine 的执行栈中
+	if narg > 0 {
+		// 从 argp 参数开始的位置，复制 narg 个字节到 spArg（参数拷贝）
+		memmove(unsafe.Pointer(spArg), unsafe.Pointer(argp), uintptr(narg))
+		// 栈到栈的拷贝。
+		// 如果启用了 write barrier 并且 源栈为灰色（目标始终为黑色），
+		// 则执行 barrier 拷贝。
+		// 因为目标栈上可能有垃圾，我们在 memmove 之后执行此操作。
+		if writeBarrier.needed && !_g_.m.curg.gcscandone {
+			f := findfunc(fn.fn)
+			stkmap := (*stackmap)(funcdata(f, _FUNCDATA_ArgsPointerMaps))
+			if stkmap.nbit > 0 {
+				// 我们正位于序言部分，因此栈 map 索引总是 0
+				bv := stackmapdata(stkmap, 0)
+				bulkBarrierBitmap(spArg, spArg, uintptr(bv.n)*sys.PtrSize, 0, bv.bytedata)
+			}
+		}
+	}
+
+	// 清理、创建并初始化的 g 的运行现场
+	memclrNoHeapPointers(unsafe.Pointer(&newg.sched), unsafe.Sizeof(newg.sched))
+	newg.sched.sp = sp
+	newg.stktopsp = sp
+	newg.sched.pc = funcPC(goexit) + sys.PCQuantum // +PCQuantum 从而前一个指令还在相同的函数内
+	newg.sched.g = guintptr(unsafe.Pointer(newg))
+	gostartcallfn(&newg.sched, fn)
+
+	// 初始化 g 的基本状态
+	newg.gopc = callerpc
+	newg.ancestors = saveAncestors(callergp) // 调试相关，追踪调用方
+	newg.startpc = fn.fn                     // 入口 pc
+	(...)
+
+	newg.trackingSeq = uint8(fastrand())
+	if newg.trackingSeq%gTrackingPeriod == 0 {
+		newg.tracking = true
+	}
+	// 现在将 g 更换为 _Grunnable 状态
+	casgstatus(newg, _Gdead, _Grunnable)
+
+	// 分配 goid
+	if _p_.goidcache == _p_.goidcacheend {
+		// Sched.goidgen 为最后一个分配的 id，相当于一个全局计数器
+		// 这一批必须为 [sched.goidgen+1, sched.goidgen+GoidCacheBatch].
+		// 启动时 sched.goidgen=0, 因此主 Goroutine 的 goid 为 1
+		_p_.goidcache = atomic.Xadd64(&sched.goidgen, _GoidCacheBatch)
+		_p_.goidcache -= _GoidCacheBatch - 1
+		_p_.goidcacheend = _p_.goidcache + _GoidCacheBatch
+	}
+	newg.goid = int64(_p_.goidcache)
+	_p_.goidcache++
+	(...)
+
+	releasem(_g_.m)
+  return newg
+}
+
+//go:nosplit 函数在执行过程中不会发生扩张和抢占
+func releasem(mp *m) {
+	_g_ := getg()
+	mp.locks--
+	if mp.locks == 0 && _g_.preempt {
+		// restore the preemption request in case we've cleared it in newstack 如果我们在 newstack 中清除了抢占请求，则恢复抢占请求
+		_g_.stackguard0 = stackPreempt
+	}
+}
+```
+
+创建 G 的过程也是相对比较复杂的，我们来总结一下这个过程：
+
+1. 首先尝试从 P 本地 gfree 链表或全局 gfree 队列获取已经执行过的 g
+2. 初始化过程中程序无论是本地队列还是全局队列都不可能获取到 g，因此创建一个新的 g，并为其分配运行线程（执行栈），这时 g 处于 `_Gidle` 状态
+3. 创建完成后，g 被更改为 `_Gdead` 状态，并根据要执行函数的入口地址和参数，初始化执行栈的 SP 和参数的入栈位置，并将需要的参数拷贝一份存入执行栈中
+4. 根据 SP、参数，在 `g.sched` 中保存 SP 和 PC 指针来初始化 g 的运行现场
+5. 将调用方、要执行的函数的入口 PC 进行保存，并将 g 的状态更改为 `_Grunnable`
+6. 给 Goroutine 分配 id，并将其放入 P 本地队列的队头或全局队列（初始化阶段队列肯定不是满的，因此不可能放入全局队列）
+7. 检查空闲的 P，将其唤醒，准备执行 G，但我们目前处于初始化阶段，主 Goroutine 尚未开始执行，因此这里不会唤醒 P。
+
+## 小结
+
+整个运行链条：`mcommoninit` –> `procresize` –> `newproc`。
+
+在调度器的初始化过程中，首先通过 `mcommoninit` 对 M 的信号 G 进行初始化。 而后通过 `procresize` 创建与 CPU 核心数 (或与用户指定的 GOMAXPROCS) 相同的 P。 最后通过 `newproc` 创建包含可以运行要执行函数的执行栈、运行现场的 G，并将创建的 G 放入刚创建好的 P 的本地可运行队列（第一个入队的 G，也就是主 Goroutine 要执行的函数体）， 完成 G 的创建。
+
+调度器的设计还是相当巧妙的。它通过引入一个 P，巧妙的减缓了全局锁的调用频率，进一步压榨了机器的性能。 Goroutine 本身也不是什么黑魔法，运行时只是将其作为一个需要运行的入口地址保存在了 G 中， 同时对调用的参数进行了一份拷贝。我们说 P 是处理器自身的抽象，但 P 只是一个纯粹的概念。相反，M 才是运行代码的真身。
+
