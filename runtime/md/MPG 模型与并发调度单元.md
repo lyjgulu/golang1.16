@@ -301,3 +301,268 @@ func mcommoninit(mp *m) {
 
 ![p-status](https://raw.githubusercontent.com/lyjgulu/golang1.16/main/runtime/image/p-status.png)
 
+通常情况下（在程序运行时不调整 P 的个数），P 只会在四种状态下进行切换。 当程序刚开始运行进行初始化时，所有的 P 都处于 `_Pgcstop` 状态， 随着 P 的初始化（`runtime.procresize`），会被置于 `_Pidle`。
+
+当 M 需要运行时，会 `runtime.acquirep`，并通过 `runtime.releasep` 来释放。 当 G 执行时需要进入系统调用时，P 会被设置为 `_Psyscall`， 如果这个时候被系统监控抢夺（`runtime.retake`），则 P 会被重新修改为 `_Pidle`。 如果在程序运行中发生 GC，则 P 会被设置为 `_Pgcstop`， 并在 `runtime.startTheWorld` 时重新调整为 `_Pidle` 或者 `_Prunning`。
+
+因为这里我们还在讨论初始化过程，我们先只关注 `runtime.procresize` 这个函数：
+
+``` go
+// src/runtime/proc.go
+func procresize(nprocs int32) *p {
+	assertLockHeld(&sched.lock)
+	assertWorldStopped()
+
+	old := gomaxprocs			// 获取先前的 P 个数
+	if old < 0 || nprocs <= 0 {
+		throw("procresize: invalid arg")
+	}
+	if trace.enabled {
+		traceGomaxprocs(nprocs)
+	}
+
+	// update statistics
+	now := nanotime()		// 更新统计信息，记录此次修改 gomaxprocs 的时间
+	if sched.procresizetime != 0 {
+		sched.totaltime += int64(old) * (now - sched.procresizetime)
+	}
+	sched.procresizetime = now
+
+	maskWords := (nprocs + 31) / 32
+
+  // 必要时增加 allp
+	// 这个时候本质上是在检查用户代码是否有调用过 runtime.MAXGOPROCS 调整 p 的数量
+	// 此处多一步检查是为了避免内部的锁，如果 nprocs 明显小于 allp 的可见数量（因为 len）
+	// 则不需要进行加锁
+	// Grow allp if necessary.
+	if nprocs > int32(len(allp)) {
+		// Synchronize with retake, which could be running
+		// concurrently since it doesn't run on a P.
+    // 此处与 retake 同步，它可以同时运行，因为它不会在 P 上运行。
+		lock(&allpLock)
+		if nprocs <= int32(cap(allp)) {
+      // 如果 nprocs 被调小了，扔掉多余的 p
+			allp = allp[:nprocs]
+		} else {
+      // 否则（调大了）创建更多的 p
+			nallp := make([]*p, nprocs)
+			// Copy everything up to allp's cap so we
+			// never lose old allocated Ps.
+      // 将原有的 p 复制到新创建的 new all p 中，不浪费旧的 p
+			copy(nallp, allp[:cap(allp)])
+			allp = nallp
+		}
+
+		if maskWords <= int32(cap(idlepMask)) {
+			idlepMask = idlepMask[:maskWords]
+			timerpMask = timerpMask[:maskWords]
+		} else {
+			nidlepMask := make([]uint32, maskWords)
+			// No need to copy beyond len, old Ps are irrelevant.
+			copy(nidlepMask, idlepMask)
+			idlepMask = nidlepMask
+
+			ntimerpMask := make([]uint32, maskWords)
+			copy(ntimerpMask, timerpMask)
+			timerpMask = ntimerpMask
+		}
+		unlock(&allpLock)
+	}
+
+	// initialize new P's
+  // 初始化新的P
+	for i := old; i < nprocs; i++ {
+		pp := allp[i]
+    // 如果 p 是新创建的(新创建的 p 在数组中为 nil)，则申请新的 P 对象
+		if pp == nil {
+			pp = new(p)
+		}
+		pp.init(i)
+		atomicstorep(unsafe.Pointer(&allp[i]), unsafe.Pointer(pp))
+	}
+
+	_g_ := getg()
+  // 如果当前正在使用的 P 应该被释放，则更换为 allp[0]
+	// 否则是初始化阶段，没有 P 绑定当前 P allp[0]
+	if _g_.m.p != 0 && _g_.m.p.ptr().id < nprocs {
+		// continue to use the current P
+    // 继续使用当前 P
+		_g_.m.p.ptr().status = _Prunning
+		_g_.m.p.ptr().mcache.prepareForSweep()
+	} else {
+		// release the current P and acquire allp[0]. 释放当前 P，因为已失效
+		//
+		// We must do this before destroying our current P 
+		// because p.destroy itself has write barriers, so we
+		// need to do that from a valid P.
+    // 我们必须在销毁当前 P 之前执行此操作，因为 p.destroy 本身具有写入障碍，因此我们需要从有效 P 执行此操作。
+		if _g_.m.p != 0 {
+			if trace.enabled {
+				// Pretend that we were descheduled
+				// and then scheduled again to keep
+				// the trace sane.
+        // 假装我们被取消调度，然后再次调度以保持跟踪正常。
+				traceGoSched()
+				traceProcStop(_g_.m.p.ptr())
+			}
+			_g_.m.p.ptr().m = 0
+		}
+		_g_.m.p = 0
+    // 更换到 allp[0]
+		p := allp[0]
+		p.m = 0
+		p.status = _Pidle
+		acquirep(p)
+		if trace.enabled {
+			traceGoStart()
+		}
+	}
+
+	// g.m.p is now set, so we no longer need mcache0 for bootstrapping.
+	mcache0 = nil
+
+	// release resources from unused P's 从未使用的 p 释放资源
+	for i := nprocs; i < old; i++ {
+		p := allp[i]
+		p.destroy()
+		// can't free P itself because it can be referenced by an M in syscall 不能释放 p 本身，因为他可能在 m 进入系统调用时被引用
+	}
+
+	// Trim allp.
+  // 清理完毕后，修剪 allp, nprocs 个数之外的所有 P
+	if int32(len(allp)) != nprocs {
+		lock(&allpLock)
+		allp = allp[:nprocs]
+		idlepMask = idlepMask[:maskWords]
+		timerpMask = timerpMask[:maskWords]
+		unlock(&allpLock)
+	}
+	// 将没有本地任务的 P 放到空闲链表中
+	var runnablePs *p
+	for i := nprocs - 1; i >= 0; i-- {
+    // 挨个检查 p
+		p := allp[i]
+    // 确保不是当前正在使用的 P
+		if _g_.m.p.ptr() == p {
+			continue
+		}
+    // 将 p 设为 idel
+		p.status = _Pidle
+		if runqempty(p) {
+      // 放入 idle 链表
+			pidleput(p)
+		} else {
+      // 如果有本地任务，则为其绑定一个 M
+			p.m.set(mget())
+      // 第一个循环为 nil，后续则为上一个 p
+			// 此处即为构建可运行的 p 链表
+			p.link.set(runnablePs)
+			runnablePs = p
+		}
+	}
+	stealOrder.reset(uint32(nprocs))
+	var int32p *int32 = &gomaxprocs // make compiler check that gomaxprocs is an int32
+	atomic.Store((*uint32)(unsafe.Pointer(int32p)), uint32(nprocs))
+	return runnablePs // 返回所有包含本地任务的 P 链表
+}
+
+// 初始化 pp，
+func (pp *p) init(id int32) {
+	// p 的 id 就是它在 allp 中的索引
+	pp.id = id
+	// 新创建的 p 处于 _Pgcstop 状态
+	pp.status = _Pgcstop
+	(...)
+
+	// 为 P 分配 cache 对象
+	if pp.mcache == nil {
+		// 如果 old == 0 且 i == 0 说明这是引导阶段初始化第一个 p
+		if id == 0 {
+			(...)
+			pp.mcache = getg().m.mcache // bootstrap
+		} else {
+			pp.mcache = allocmcache()
+		}
+	}
+	(...)
+}
+
+// 释放未使用的 P，一般情况下不会执行这段代码
+func (pp *p) destroy() {
+	// 将所有 runnable Goroutine 移动至全局队列
+	for pp.runqhead != pp.runqtail {
+		// 从本地队列中 pop
+		pp.runqtail--
+		gp := pp.runq[pp.runqtail%uint32(len(pp.runq))].ptr()
+		// push 到全局队列中
+		globrunqputhead(gp)
+	}
+	if pp.runnext != 0 {
+		globrunqputhead(pp.runnext.ptr())
+		pp.runnext = 0
+	}
+	(...)
+	// 将当前 P 的空闲的 G 复链转移到全局
+	gfpurge(pp)
+	(...)
+	pp.status = _Pdead
+}
+```
+
+`procresize` 这个函数相对较长，我们来总结一下它主要干了什么事情：
+
+1. 调用时已经 STW，记录调整 P 的时间；
+2. 按需调整 `allp` 的大小；
+3. 按需初始化 `allp` 中的 P；
+4. 如果当前的 P 还可以继续使用（没有被移除），则将 P 设置为 _Prunning；
+5. 否则将第一个 P 抢过来给当前 G 的 M 进行绑定
+6. 从 `allp` 移除不需要的 P，将释放的 P 队列中的任务扔进全局队列；
+7. 最后挨个检查 P，将没有任务的 P 放入 idle 队列
+8. 除去当前 P 之外，将有任务的 P 彼此串联成链表，将没有任务的 P 放回到 idle 链表中
+
+显然，在运行 P 初始化之前，我们刚刚初始化完 M，因此第 7 步中的绑定 M 会将当前的 P 绑定到初始 M 上。 而后由于程序刚刚开始，P 队列是空的，所以他们都会被链接到可运行的 P 链表上处于 `_Pidle` 状态。
+
+为了向用户层提供对调度器的控制，runtime 包中提供了一些方法达到了这一目的，在本章的最后， 我们来快速过一遍在前面还未提及的在 runtime 包中一些与调度器相关的公共方法。
+
+## GOMAXPROCS
+
+在大部分的时间里，P 的数量是不会被动态调整的。 而 `runtime.GOMAXPROCS` 能够在运行时动态调整 P 的数量。
+
+``` go
+// src/runtime/debug.go
+// GOMAXPROCS 设置能够同时执行线程的最大 CPU 数，并返回原先的设定。
+// 如果 n < 1，则他不会进行任何修改。
+// 机器上的逻辑 CPU 的个数可以从 NumCPU 调用上获取。
+// 该调用会在调度器进行改进后被移除。
+func GOMAXPROCS(n int) int {
+	...
+
+	// 当调整 P 的数量时，调度器会被锁住
+	lock(&sched.lock)
+	ret := int(gomaxprocs)
+	unlock(&sched.lock)
+
+	// 返回原有设置
+	if n <= 0 || n == ret {
+		return ret
+	}
+
+	// 停止一切事物，将 STW 的原因设置为 P 被调整
+	stopTheWorld("GOMAXPROCS")
+
+	// STW 后，修改 P 的数量
+	newprocs = int32(n)
+
+	// 重新恢复
+	// 在这个过程中，startTheWorld 会调用 procresize 进而动态的调整 P 的数量
+	startTheWorld()
+	return ret
+}
+```
+
+## G 初始化
+
+运行完 `runtime.procresize` 之后，我们知道，主 Goroutine 会以被调度器调度的方式进行运行， 这将由 `runtime.newproc` 来完成主 Goroutine 的初始化工作。
+
+在看 `runtime.newproc` 之前，我们先大致浏览一下 G 的各个状态，如图 3 所示。
+
