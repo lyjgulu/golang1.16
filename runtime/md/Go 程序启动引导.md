@@ -293,3 +293,13 @@ func schedinit() {
 - `mcommoninit()` 系统线程的部分初始化工作
 - `gcinit()` 垃圾回收器初始化
 - `procresize()` 根据 CPU 核心数，初始化系统线程的本地缓存
+
+## 总结
+
+![goMainInit](https://raw.githubusercontent.com/lyjgulu/golang1.16/main/runtime/image/goMainInit.png)
+
+Go 程序既不是从 `main.main` 直接启动，也不是从 `runtime.main` 直接启动。 相反，其实际的入口位于 `runtime._rt0_amd64_*`。随后会转到 `runtime.rt0_go` 调用。在这个调用中，除了进行运行时类型检查外，还确定了两个很重要的运行时常量，即处理器核心数以及内存物理页大小。
+
+程序引导和初始化工作是整个运行时最关键的基础步骤之一。在 `schedinit` 这个函数的调用过程中， 还会完成整个程序运行时的初始化，包括调度器、执行栈、内存分配器、调度器、垃圾回收器等组件的初始化。 最后通过 `newproc` 和 `mstart` 调用进而开始由调度器转为执行主 goroutine。
+
+运行时组件的内容我们留到组件各自的章节中进行讨论，我们在下一节中着先着重讨论当一切都初始化好后， 程序的正式启动过程，即 `runtime.main`。
