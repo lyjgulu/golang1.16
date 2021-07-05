@@ -19,10 +19,11 @@ TEXT _rt0_amd64_linux_lib(SB),NOSPLIT,$0
 
 ## 入口详情(参数)
 
-- 位于：`src/runtime/asm_arm.s` 
+- 位于：`src/runtime/asm_arm64.s` 
 - 栈指针 SP 的前两个值分别对应 `argc` 和 `argv`
 
 ``` c
+// go 1.16 src/runtime/asm_arm64.s 14行
 TEXT _rt0_amd64(SB),NOSPLIT,$-8
 	MOVQ	0(SP), DI	// argc
 	LEAQ	8(SP), SI	// argv
@@ -153,7 +154,7 @@ func args(c int32, v **byte) {
 }
 ```
 
-3. Darwin等操作系统不关注
+3. Darwin、OpenBSD等操作系统不关注
 
 ## 运行时组件核心
 
@@ -167,7 +168,7 @@ TEXT runtime·rt0_go(SB),NOSPLIT,$0
 	MOVQ	$runtime·mainPC(SB), AX
 	PUSHQ	AX
 	PUSHQ	$0			// 参数大小
-	CALL	runtime·newproc(SB)
+	CALL	runtime·newproc(SB) // G 初始化
 	POPQ	AX
 	POPQ	AX
 

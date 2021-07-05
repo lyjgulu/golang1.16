@@ -149,9 +149,9 @@ func main() {
 
 - 关键步骤
   1. `systemstack` 会运行 `newm(sysmon, nil)` 启动后台监控
-  2. `runtime_init` 负责执行运行时的多个初始化函数 `runtime.init`
+  2. `runtime_inittask` 负责执行运行时的多个初始化函数 `runtime.init`
   3. `gcenable` 启用垃圾回收器
-  4. `main_init` 开始执行用户态 `main.init` 函数，这意味着所有的 `main.init` 均在同一个主 Goroutine 中执行
+  4. `main_init` 开始执行用户态 `main.inittask` 函数，这意味着所有的 `main.init` 均在同一个主 Goroutine 中执行
   5. `main_main` 开始执行用户态 `main.main` 函数，这意味着 `main.main` 和 `main.init` 均在同一个 Goroutine 中执行。
 
 - 重要 init 函数

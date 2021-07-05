@@ -9,8 +9,8 @@
 
 运行时调度器的任务是给不同的工作线程 (worker thread) 分发可供运行的（ready-to-run）Goroutine。 我们不妨设每个工作线程总是贪心的执行所有存在的 Goroutine，那么当运行进程中存在 n 个线程（M），且 每个 M 在某个时刻有且只能调度一个 G。根据抽屉原理，可以很容易的证明这两条性质：
 
-- 性质 1：当用户态代码创建了 p(p>n)p(p>n) 个 G 时，则必定存在 p−np−n 个 G 尚未被 M 调度执行；
-- 性质 2：当用户态代码创建的 q (q < n) 时，则必定存在 n-q 个 M 不存在正在调度的 G。
+- 性质 1：当用户态代码创建了 $p (p > n)$ 个 G 时，则必定存在  $p-n$ 个 G 尚未被 M 调度执行；
+- 性质 2：当用户态代码创建的 $q (q < n)$ 时，则必定存在 $n-q$ 个 M 不存在正在调度的 G。
 
 这两条性质分别决定了工作线程的 **暂止（park）** 和 **复始（unpark）** 。
 
@@ -145,7 +145,9 @@ type p struct {
 	// Queue of runnable goroutines. Accessed without lock.
 	runqhead 	uint32			// 可运行的 Goroutine 队列，可无锁访问
 	runqtail 	uint32
-	runq     	[256]guintptr  
+	runq     	[256]guintptr 
+  
+  ...
 }
 ```
 
@@ -155,12 +157,12 @@ type p struct {
 
 ```go
 type g struct {
-	stack struct {
+	stack struct {	// offset known to runtime/cgo
 		lo uintptr
 		hi uintptr
 	} 							// 栈内存：[stack.lo, stack.hi)
-	stackguard0	uintptr
-	stackguard1 uintptr
+	stackguard0	uintptr		// offset known to liblink
+	stackguard1 uintptr		// offset known to liblink
 
 	_panic       *_panic
 	_defer       *_defer
@@ -354,8 +356,8 @@ func procresize(nprocs int32) *p {
 		}
 
 		if maskWords <= int32(cap(idlepMask)) {
-			idlepMask = idlepMask[:maskWords]
-			timerpMask = timerpMask[:maskWords]
+			idlepMask = idlepMask[:maskWords]		// TODO
+			timerpMask = timerpMask[:maskWords]	// TODO	
 		} else {
 			nidlepMask := make([]uint32, maskWords)
 			// No need to copy beyond len, old Ps are irrelevant.
@@ -662,13 +664,14 @@ func newproc1(fn *funcval, argp *uint8, narg int32, callergp *g, callerpc uintpt
 		throw("go of nil func value")
 	}
 	acquirem() // disable preemption because it can be holding p in a local var 禁止这时 g 的 m 被抢占因为它可以在一个局部变量中保存 p
-	siz := narg
-	siz = (siz + 7) &^ 7
   /*func acquirem() *m {
     _g_ := getg()
     _g_.m.locks++
     return _g_.m
 	}*/
+	siz := narg
+	siz = (siz + 7) &^ 7
+ 
 	(...)
 
 	// 获得 p
@@ -680,7 +683,7 @@ func newproc1(fn *funcval, argp *uint8, narg int32, callergp *g, callerpc uintpt
 	// 也可能运行中本来就已经耗尽了
 	if newg == nil {
 		// 创建一个拥有 _StackMin 大小的栈的 g
-		newg = malg(_StackMin)
+		newg = malg(_StackMin)	// 2MB
 		// 将新创建的 g 从 _Gidle 更新为 _Gdead 状态
 		casgstatus(newg, _Gidle, _Gdead)
 		allgadd(newg) // 将 Gdead 状态的 g 添加到 allg，这样 GC 不会扫描未初始化的栈
